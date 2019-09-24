@@ -218,6 +218,8 @@ def main(options):
                 "mutually exclusive")
 
     print("getting issues from bitbucket")
+    pr_offset = get_pullrequest_offset(bb_url, options.bb_auth)
+
     issues_iterator = get_issues(bb_url, options.skip, options.bb_auth)
 
     issues_iterator = fill_gaps(issues_iterator, options.skip)
@@ -242,11 +244,11 @@ def main(options):
 
         gh_issue = convert_issue(
             issue, comments, changes,
-            options, attachment_links, gh_milestones,
-
+            options, attachment_links, gh_milestones, pr_offset
         )
+
         gh_comments = [
-            convert_comment(c, options) for c in comments
+            convert_comment(c, options, pr_offset) for c in comments
             if c['content']['raw'] is not None
         ]
 
@@ -327,7 +329,25 @@ def fill_gaps(issues_iterator, offset):
         yield issue
 
 
-repourl_created = False
+def get_pullrequest_offset(bb_url, bb_auth):
+    """Fetch the highest issue id from Bitbucket."""
+
+    params = {"sort": "-id"} # sort in descending order
+    respo = requests.get(bb_url, auth=bb_auth, params=params)
+    if respo.status_code == 200:
+        result = respo.json()
+        # check to see if there are issues to process, if not break out.
+        if result['size'] == 0:
+            return 0
+
+        issue = result['values'][0]
+        return issue['id']
+
+    else:
+        raise RuntimeError(
+            "Bitbucket returned an unexpected HTTP status code: {}"
+            .format(respo.status_code)
+        )
 
 
 def process_wiki_attachments(
@@ -505,7 +525,7 @@ def get_issue_changes(issue_id, bb_url, bb_auth):
 
 
 def convert_issue(
-        issue, comments, changes, options, attachment_links, gh_milestones):
+        issue, comments, changes, options, attachment_links, gh_milestones, pr_offset):
     """
     Convert an issue schema from Bitbucket to GitHub's Issue Import API
     """
@@ -533,7 +553,7 @@ def convert_issue(
     is_closed = issue['state'] not in ('open', 'new', 'on hold')
     out = {
         'title': issue['title'],
-        'body': format_issue_body(issue, attachment_links, options),
+        'body': format_issue_body(issue, attachment_links, options, pr_offset),
         'closed': is_closed,
         'created_at': convert_date(issue['created_on']),
         'updated_at': convert_date(issue['updated_on']),
@@ -568,14 +588,14 @@ def convert_issue(
     return out
 
 
-def convert_comment(comment, options):
+def convert_comment(comment, options, pr_offset):
     """
     Convert an issue comment from Bitbucket schema to GitHub's Issue Import API
     schema.
     """
     return {
         'created_at': convert_date(comment['created_on']),
-        'body': format_comment_body(comment, options),
+        'body': format_comment_body(comment, options, pr_offset),
     }
 
 
@@ -646,11 +666,11 @@ Attachments: {attachment_links}
 
 """
 
-def format_issue_body(issue, attachment_links, options):
+def format_issue_body(issue, attachment_links, options, pr_offset):
     content = issue['content']['raw']
     content = convert_changesets(content, options)
     content = convert_creole_braces(content)
-    content = convert_links(content, options)
+    content = convert_links(content, options, pr_offset)
     content = convert_users(content, options)
     reporter = issue.get('reporter')
     # print("\nIssue, reporter: ", issue, reporter)
@@ -686,11 +706,11 @@ def format_issue_body(issue, attachment_links, options):
     return template.format(**data)
 
 
-def format_comment_body(comment, options):
+def format_comment_body(comment, options, pr_offset):
     content = comment['content']['raw']
     content = convert_changesets(content, options)
     content = convert_creole_braces(content)
-    content = convert_links(content, options)
+    content = convert_links(content, options, pr_offset)
     content = convert_users(content, options)
     author = comment['user']
     data = dict(
@@ -853,14 +873,31 @@ def convert_creole_braces(content):
     return "\n".join(lines)
 
 
-def convert_links(content, options):
+PULLREQUEST_RE = re.compile(r'(?:pullrequest|pull request|PR)(?:\s+)(#[1-9][0-9]*)')
+
+
+def convert_links(content, options, pr_offset):
     """
     Convert absolute links to other issues related to this repository to
-    relative links ("#<id>").
+    relative links ("#<id>"). Consider id offset in links to pull requests.
     """
-    pattern = r'https://bitbucket.org/{repo}/issue/(\d+)'.format(
+    def replace_pr_id(match):
+        matched = match.group(1)
+        original_id = int(matched) if matched[0] != '#' else int(matched[1:])
+        id = original_id + pr_offset
+        return 'pull request #{}'.format(id)
+
+    content = PULLREQUEST_RE.sub(replace_pr_id, content)
+
+    pattern_issue = r'https://bitbucket.org/{repo}/issue/(\d+)'.format(
         repo=options.bitbucket_repo)
-    return re.sub(pattern, r'#\1', content)
+    content = re.sub(pattern_issue, r'#\1', content)
+
+    pattern_pr = r'https://bitbucket.org/{repo}/pullrequests/(\d+)'.format(
+        repo=options.bitbucket_repo)
+    content = re.sub(pattern_pr, replace_pr_id, content)
+
+    return content
 
 
 def lookupUsername(account_id):
