@@ -289,8 +289,95 @@ def main(options):
                 assert gh_issue_id == issue['id']
         print("Completed {} issues".format(index + 1))
 
+    bb_pr_url = "https://api.bitbucket.org/2.0/repositories/{repo}/pullrequests".format(
+        repo=options.bitbucket_repo)
+
+    print("getting pull requests from bitbucket")
+    pr_iterator = get_issues(bb_pr_url + "?state=MERGED&state=OPEN&state=DECLINED&state=SUPERSEDED", options.skip, options.bb_auth)
+
+    pr_iterator = fill_pr_gaps(pr_iterator, options.skip)
+
+    refs_url = 'https://api.github.com/repos/{repo}/git/refs'.format(repo=options.github_repo)
+    response = requests.get('{}/heads'.format(refs_url), auth=options.gh_auth,)
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Failed to get heads from: {} due to unexpected HTTP "
+            "status code: {}"
+            .format(refs_url, response.status_code)
+        )
+    result = response.json()
+    ref = result[0]
+    sha = ref['object']['sha']
+
+    for index, pr in enumerate(pr_iterator):
+        if isinstance(pr, DummyPullRequest):
+            pr_comments = []
+            #pr_changes = []
+        else:
+            pr_comments = get_issue_comments(pr['id'], bb_pr_url, options.bb_auth)
+            #pr_changes = get_issue_changes(pr['id'], bb_pr_url, options.bb_auth)
+
+        is_closed = pr['state'] not in ('OPEN', 'open', 'new')
+        is_closed = is_closed or isinstance(pr, DummyPullRequest)
+        gh_pr = convert_pr(
+            pr, pr_comments, #pr_changes,
+            options, pr_offset
+        )
+
+        gh_pr_comments = [
+            convert_comment(c, options, pr_offset) for c in pr_comments
+            if c['content']['raw'] is not None
+        ]
+
+        #if options.mention_changes:
+        #    gh_pr_comments += [
+        #        converted_change for converted_change in
+        #        [convert_change(c, options) for c in pr_changes]
+        #        if converted_change
+        #    ]
+
+        if options.dry_run:
+            print("\nPullRequest: ", gh_pr)
+            print("\nComments: ", gh_pr_comments)
+        else:
+            branch_ref = create_pr_branch(pr['id'], options.github_repo, options.gh_auth, options.bitbucket_repo, refs_url, sha)
+            create_pr_dummy_commit(pr['id'], options.github_repo, options.gh_auth, options.bitbucket_repo)
+            push_respo = push_github_pr(
+                gh_pr, gh_pr_comments, options.github_repo,
+                options.gh_auth, is_closed, branch_ref, True #delete_branches
+            )
+            # issue POSTed successfully, now verify the import finished before
+            # continuing. Otherwise, we risk issue IDs not being sync'd between
+            # Bitbucket and GitHub because GitHub processes the data in the
+            # background, so IDs can be out of order if two issues are POSTed
+            # and the latter finishes before the former. For example, if the
+            # former had a bunch more comments to be processed.
+            # https://github.com/jeffwidman/bitbucket-issue-migration/issues/45
+#            status_url = push_respo.json()['url']
+#            resp = verify_github_issue_import_finished(
+#                status_url, options.gh_auth, headers)
+
+            # Verify GH & BB issue IDs match.
+            # If this assertion fails, convert_links() will have incorrect
+            # output.  This condition occurs when:
+            # - the GH repository has pre-existing issues.
+            # - the Bitbucket repository has gaps in the numbering.
+#            if resp:
+#                gh_pr_url = resp.json()['pr_url']
+#                gh_pr_id = int(gh_pr_url.split('/')[-1])
+#                assert gh_pr_id == pr['id']
+        print("Completed {} pull requests".format(index + 1))
+
 
 class DummyIssue(dict):
+    def __init__(self, num):
+        self.update(
+            id=num,
+            #...
+        )
+
+
+class DummyPullRequest(dict):
     def __init__(self, num):
         self.update(
             id=num,
@@ -327,6 +414,20 @@ def fill_gaps(issues_iterator, offset):
             yield DummyIssue(dummy_id)
         current_id = issue_id
         yield issue
+
+
+def fill_pr_gaps(pr_iterator, offset):
+    """
+    Fill gaps in the pull requests, assuming an initial offset.
+    """
+
+    current_id = offset
+    for pr in pr_iterator:
+        pr_id = pr['id']
+        for dummy_id in range(current_id + 1, pr_id):
+            yield DummyPullRequest(dummy_id)
+        current_id = pr_id
+        yield pr
 
 
 def get_pullrequest_offset(bb_url, bb_auth):
@@ -588,6 +689,31 @@ def convert_issue(
     return out
 
 
+def convert_pr(
+        pr, comments, #changes,
+        options, pr_offset):
+    """
+    Convert an pullrequest schema from Bitbucket to GitHub's Issue/PullRequest API
+    """
+
+    if isinstance(pr, DummyPullRequest):
+        return dict(
+            title="dummy pull request",
+            body="filler pull request created by bitbucket_issue_migration",
+            closed=True,
+        )
+
+    is_closed = pr['state'] not in ('OPEN', 'open', 'new')
+    out = {
+        'title': pr['title'],
+        'head': '{bb_repo}_pullrequest{pr}'.format(bb_repo=options.bitbucket_repo.replace('/', '_'), pr=pr['id']),
+        'base': 'master',
+        'body': format_pr_body(pr, options, pr_offset),
+    }
+
+    return out
+
+
 def convert_comment(comment, options, pr_offset):
     """
     Convert an issue comment from Bitbucket schema to GitHub's Issue Import API
@@ -666,6 +792,14 @@ Attachments: {attachment_links}
 
 """
 
+PR_TEMPLATE = """\
+**[Original pull request](https://bitbucket.org/{repo}/pullrequests/{id}) by {author}.**
+
+{sep}
+
+{content}
+"""
+
 def format_issue_body(issue, attachment_links, options, pr_offset):
     content = issue['content']['raw']
     content = convert_changesets(content, options)
@@ -703,6 +837,27 @@ def format_issue_body(issue, attachment_links, options, pr_offset):
     )
     skip_user = reporter and reporter['nickname'] == options.bb_skip
     template = ISSUE_TEMPLATE_SKIP_USER if skip_user else ISSUE_TEMPLATE
+    return template.format(**data)
+
+
+def format_pr_body(pr, options, pr_offset):
+    content = pr['summary']['raw']
+    content = convert_changesets(content, options)
+    content = convert_creole_braces(content)
+    content = convert_links(content, options, pr_offset)
+    content = convert_users(content, options)
+    author = pr.get('author')
+    # print("\nPullRequest, author: ", pr, author)
+
+    data = dict(
+        # anonymous issues are missing 'reported_by' key
+        author=format_user(author, options),
+        sep=SEP,
+        repo=options.bitbucket_repo,
+        id=pr['id'],
+        content=content
+    )
+    template = PR_TEMPLATE
     return template.format(**data)
 
 
@@ -900,6 +1055,7 @@ def convert_links(content, options, pr_offset):
     return content
 
 
+
 def lookupUsername(account_id):
     """
     Lookup username (nickname) by account_id from bitbucket users.
@@ -995,19 +1151,141 @@ def push_github_issue(issue, comments, github_repo, auth, headers):
     issue_data = {'issue': issue, 'comments': comments}
     url = 'https://api.github.com/repos/{repo}/import/issues'.format(
         repo=github_repo)
-    respo = requests.post(url, json=issue_data, auth=auth, headers=headers)
-    if respo.status_code == 202:
-        return respo
-    elif respo.status_code == 422:
+    response = requests.post(url, json=issue_data, auth=auth, headers=headers)
+    if response.status_code == 202:
+        return response
+    elif response.status_code == 422:
         raise RuntimeError(
             "Initial import validation failed for issue '{}' due to the "
-            "following errors:\n{}".format(issue['title'], respo.json())
+            "following errors:\n{}".format(issue['title'], response.json())
         )
     else:
         raise RuntimeError(
             "Failed to POST issue: '{}' due to unexpected HTTP status code: {}"
-            .format(issue['title'], respo.status_code)
+            .format(issue['title'], response.status_code)
         )
+
+
+def create_pr_branch(pr_id, github_repo, auth, bitbucket_repo, refs_url, sha):
+    #refs_url = 'https://api.github.com/repos/{repo}/git/refs'.format(repo=github_repo)
+    #response = requests.get('{}/heads'.format(refs_url), auth=auth,)
+    #if response.status_code != 200:
+    #    raise RuntimeError(
+    #        "Failed to get heads from: {} due to unexpected HTTP "
+    #        "status code: {}"
+    #        .format(refs_url, response.status_code)
+    #    )
+    #result = response.json()
+    #ref = result[0]
+    branch_data = {
+        'ref': 'refs/heads/{bb_repo}_pullrequest{pr}'.format(bb_repo=bitbucket_repo.replace('/', '_'), pr=pr_id),
+        'sha': sha
+        #'sha': ref['object']['sha']
+    }
+    response = requests.post(refs_url, json=branch_data, auth=auth,)
+    if response.status_code != 201:
+        raise RuntimeError(
+            "Failed to create branch {} at: {} due to unexpected HTTP "
+            "status code: {}"
+            .format('{bb_repo}_pullrequest{pr}'.format(bb_repo=bitbucket_repo.replace('/', '_'), pr=pr_id), refs_url, response.status_code)
+        )
+    branch_result = response.json()
+    #print(branch_result)
+    return branch_data['ref']
+
+
+def create_pr_dummy_commit(pr_id, github_repo, auth, bitbucket_repo):
+    filename = 'dummy.txt'
+    upload_url = 'https://api.github.com/repos/{repo}/contents/{bb_repo}_pullrequest{pr}/{file}'.format(repo=github_repo, bb_repo=bitbucket_repo.replace('/', '_'), pr=pr_id, file=filename)
+    upload_data = {
+        'message': 'dummy contents {} added to pullrequest {} from repo {}'.format(filename, pr_id, bitbucket_repo),
+        'branch': '{bb_repo}_pullrequest{pr}'.format(bb_repo=bitbucket_repo.replace('/', '_'), pr=pr_id),
+        'content': base64.b64encode('{pr}'.format(pr=pr_id).encode('ascii')).decode('ascii')
+    }
+    headers = {
+        'Content-Type': 'application/vnd.github.v3+json'
+    }
+    response = requests.put(upload_url, json=upload_data, auth=auth, headers=headers)
+    if response.status_code != 201:
+        raise RuntimeError(
+            "Failed to add dummy contents to: {} due to "
+            "unexpected HTTP status code: {}"
+            .format(upload_url, response.status_code)
+        )
+
+
+def create_pr_comments(pr_id, comments, github_repo, auth):
+    upload_url = 'https://api.github.com/repos/{repo}/issues/{pr}/comments'.format(repo=github_repo, pr=pr_id)
+    for comment in comments:
+        upload_data = {
+            'created_at': comment['created_at'],
+            'body': comment['body']
+        }
+        headers = {
+            'Content-Type': 'application/vnd.github.v3+json'
+        }
+        response = requests.post(upload_url, json=upload_data, auth=auth, headers=headers)
+        if response.status_code != 201:
+            raise RuntimeError(
+                "Failed to add pull request comment to: {} due to "
+                "unexpected HTTP status code: {}"
+                .format(upload_url, response.status_code)
+            )
+
+
+def push_github_pr(pr_data, comments, github_repo, auth, is_closed, branch_ref, delete_branches):
+    """
+    Push a single pull request to GitHub.
+
+    Importing via GitHub's normal Issue API quickly triggers anti-abuse rate
+    limits. So we use their dedicated Issue Import API instead:
+    https://gist.github.com/jonmagic/5282384165e0f86ef105
+    https://github.com/nicoddemus/bitbucket_issue_migration/issues/1
+    """
+
+    pr_url = 'https://api.github.com/repos/{repo}/pulls'.format(repo=github_repo)
+    headers = {
+        'Content-Type': 'application/vnd.github.v3+json'
+    }
+    response = requests.post(pr_url, json=pr_data, auth=auth, headers=headers)
+    if response.status_code != 201:
+        print(response.json())
+        raise RuntimeError(
+            "Failed to add pull request: {} due to "
+            "unexpected HTTP status code: {}"
+            .format(pr_url, response.status_code)
+        )
+
+    result = response.json()
+    #print(result)
+    pr_id = result['number']
+    create_pr_comments(pr_id, comments, github_repo, auth)
+    if is_closed:
+        patch_url = '{url}/{id}'.format(url=pr_url, id=pr_id)
+        patch_data = {
+            'title': pr_data['title'],
+            'body': pr_data['body'],
+            'state': 'closed' #,
+        }
+        response = requests.patch(patch_url, json=patch_data, auth=auth, headers=headers)
+        if response.status_code != 200:
+            print(response.json())
+            raise RuntimeError(
+                "Failed to update pull request state: {} due to "
+                "unexpected HTTP status code: {}"
+                .format(patch_url, response.status_code)
+            )
+        if delete_branches:
+            print(branch_ref)
+            branch_url = 'https://api.github.com/repos/{repo}/git/{ref}'.format(repo=github_repo, ref=branch_ref)
+            response = requests.delete(branch_url, auth=auth, headers=headers)
+            if response.status_code != 204:
+                print(response.json())
+                raise RuntimeError(
+                    "Failed to delete branch for pull request: {} due to "
+                    "unexpected HTTP status code: {}"
+                    .format(branch_url, response.status_code)
+                )
 
 
 def verify_github_issue_import_finished(status_url, auth, headers):
